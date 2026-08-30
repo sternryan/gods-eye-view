@@ -1,0 +1,26 @@
+[
+  {
+    "icao24": "a00001",
+    "type": "Traveler"
+  },
+  {
+    "icao24": "a00002",
+    "type": "Cheetah"
+  },
+  {
+    "icao24": "a00003",
+    "type": "Tiger"
+  },
+  {
+    "icao24": "a00004",
+    "type": "AG-5B"
+  },
+  {
+    "icao24": "a00005",
+    "type": "Traveler"
+  },
+  {
+    "icao24": "a00006",
+    "type": "Tiger"
+  }
+]

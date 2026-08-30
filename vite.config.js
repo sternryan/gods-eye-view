@@ -40,6 +40,13 @@ import {
   isOverBudget as isTomTomOverBudget,
 } from './src/data/tomtomTiles.js';
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
+import {
+  parseAa5Allowlist,
+  chunkAllowlist,
+  mergeAdsbLolBatch,
+  activeAa5Aircraft,
+  aa5AggregatorState,
+} from './src/data/aa5Aggregator.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -4749,6 +4756,156 @@ function adsbLolProxy() {
 }
 
 /**
+ * Vite plugin: AA5 fleet aggregator (T4, AA-5 Fleet Layer design,
+ * docs/design/aa5-fleet-layer-spec.md, "T1 rate-limit spike findings").
+ *
+ * Proxies GET /api/aa5-flights. adsb.lol caps a /v2/hex/ batch at ~125
+ * hexes/request and rate-limits bursts (empirically confirmed by the T1
+ * spike: 429s after ~4 rapid calls, clean at ~3s+ spacing) — a 2,760-hex
+ * allowlist cannot be refreshed in a single request or a single 20s cycle.
+ * So this polls a ROTATING SUBSET (one ~120-hex chunk per tick) into a
+ * server-side snapshot Map, each entry stamped with its own last-polled
+ * time, merged via the pure functions in aa5Aggregator.js. The client-facing
+ * 20s shared cache (one cache for all viewers, matching adsbLolProxy's
+ * pattern) serves the current rolling snapshot rather than forcing a fresh
+ * full-fleet poll — that decouples "how often a viewer can ask" from "how
+ * often the full fleet gets refreshed" (~AA5_TICK_MS * chunk count per full
+ * rotation).
+ *
+ * States returned to the client (`state` field): 'loading' until the first
+ * full rotation over every chunk completes (no real snapshot yet); 'delayed'
+ * once rotated if no adsb.lol poll has succeeded within
+ * AA5_STALE_FAILURE_MS (sustained failure, not just one bad tick — a single
+ * chunk's failure leaves other chunks' data intact per mergeAdsbLolBatch's
+ * additive-upsert design); otherwise 'ok'.
+ *
+ * @returns {import('vite').Plugin}
+ */
+function aa5FlightsProxy() {
+  const AA5_CHUNK_SIZE = 120; // adsb.lol path-length cap is ~125 hexes/request (T1 spike)
+  const AA5_TICK_MS = 4000; // within the empirically-safe ~3-5s adsb.lol request spacing
+  const AA5_LAST_SEEN_WINDOW_MS = 5 * 60 * 1000; // Open Questions default
+  const AA5_CLIENT_CACHE_MS = 20000; // matches the spec's Next Steps #2 shared cache
+  const AA5_STALE_FAILURE_MS = 5 * 60 * 1000; // no successful poll in 5 min -> 'delayed'
+  const AA5_ADSBLOL_HEX_BASE = 'https://api.adsb.lol/v2/hex/';
+  const AA5_ALLOWLIST_DEFAULT = 'config/aa5_allowlist.json';
+
+  /** @type {Map<string,string>} icao24 -> AA5 type, loaded once from the allowlist file. */
+  let _allowlist = new Map();
+  /** @type {string[][]} Rotating poll chunks, derived from the allowlist. */
+  let _chunks = [];
+  /** @type {number} Index of the next chunk to poll. */
+  let _chunkIndex = 0;
+  /** @type {boolean} True once every chunk has been polled at least once. */
+  let _hasCompletedFirstRotation = false;
+  /** @type {Map<string, object>} icao24 -> merged snapshot entry (see aa5Aggregator.js). */
+  const _snapshot = new Map();
+  /** @type {number|null} Epoch-ms of the last successful adsb.lol poll (any chunk). */
+  let _lastPollSuccessMs = null;
+  /** @type {number|null} Epoch-ms of the last failed adsb.lol poll (any chunk). */
+  let _lastPollErrorMs = null;
+  /** @type {boolean} A poll tick is currently in flight (ticks never overlap). */
+  let _polling = false;
+  /** @type {NodeJS.Timeout|null} The poll-loop interval handle. */
+  let _pollTimer = null;
+  /** @type {string|null} Cached client-facing response body (JSON text). */
+  let _responseCache = null;
+  /** @type {number} Epoch-ms when _responseCache was built. */
+  let _responseCacheAt = 0;
+
+  function loadAllowlist() {
+    const file = process.env.AA5_ALLOWLIST_FILE || AA5_ALLOWLIST_DEFAULT;
+    const resolved = path.isAbsolute(file) ? file : path.resolve(__dirname, file);
+    try {
+      if (!fs.existsSync(resolved)) {
+        console.warn('[AA5 Aggregator] allowlist file not found:', resolved);
+        return;
+      }
+      _allowlist = parseAa5Allowlist(fs.readFileSync(resolved, 'utf8'));
+      _chunks = chunkAllowlist(_allowlist.keys(), AA5_CHUNK_SIZE);
+      _chunkIndex = 0;
+      _hasCompletedFirstRotation = _chunks.length === 0;
+    } catch (error) {
+      console.warn('[AA5 Aggregator] failed to load allowlist:', resolved, error?.message || error);
+    }
+  }
+
+  async function pollNextChunk() {
+    if (_polling || _chunks.length === 0) return;
+    _polling = true;
+    try {
+      const chunk = _chunks[_chunkIndex];
+      const url = AA5_ADSBLOL_HEX_BASE + chunk.join(',');
+      const upstream = await fetch(url, {
+        headers: { 'User-Agent': 'gods-eye-view-aa5-aggregator/1.0' },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!upstream.ok) throw new Error(`adsb.lol HTTP ${upstream.status}`);
+      const body = await upstream.json();
+      mergeAdsbLolBatch(_snapshot, _allowlist, body, Date.now());
+      _lastPollSuccessMs = Date.now();
+    } catch (error) {
+      _lastPollErrorMs = Date.now();
+      console.warn('[AA5 Aggregator] poll tick failed:', error?.message || error);
+    } finally {
+      _chunkIndex += 1;
+      if (_chunkIndex >= _chunks.length) {
+        _chunkIndex = 0;
+        _hasCompletedFirstRotation = true;
+      }
+      _polling = false;
+    }
+  }
+
+  function ensurePollLoopStarted() {
+    if (_pollTimer) return;
+    if (_allowlist.size === 0 && _chunks.length === 0) loadAllowlist();
+    pollNextChunk(); // kick off immediately rather than waiting a full tick
+    _pollTimer = setInterval(pollNextChunk, AA5_TICK_MS);
+  }
+
+  function buildResponseBody() {
+    const now = Date.now();
+    const state = aa5AggregatorState({
+      hasCompletedFirstRotation: _hasCompletedFirstRotation,
+      lastPollSuccessMs: _lastPollSuccessMs,
+      lastPollErrorMs: _lastPollErrorMs,
+      nowMs: now,
+      staleFailureThresholdMs: AA5_STALE_FAILURE_MS,
+    });
+    const aircraft = state === 'loading' ? [] : activeAa5Aircraft(_snapshot, now, AA5_LAST_SEEN_WINDOW_MS);
+    const message = state === 'loading' ? 'loading fleet data' : state === 'delayed' ? 'data delayed' : null;
+    return JSON.stringify({ state, message, aircraft, polledAt: now, allowlistSize: _allowlist.size });
+  }
+
+  return {
+    name: 'aa5-flights-proxy',
+    configureServer(server) {
+      server.middlewares.use('/api/aa5-flights', (req, res) => {
+        try {
+          ensurePollLoopStarted();
+          const now = Date.now();
+          if (!_responseCache || now - _responseCacheAt >= AA5_CLIENT_CACHE_MS) {
+            _responseCache = buildResponseBody();
+            _responseCacheAt = now;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(_responseCache);
+        } catch (error) {
+          console.error('[AA5 Aggregator]', error?.message || String(error));
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'AA5 aggregator proxy error', state: 'delayed', aircraft: [] }));
+        }
+      });
+      server.httpServer?.on('close', () => {
+        if (_pollTimer) clearInterval(_pollTimer);
+        _pollTimer = null;
+      });
+    },
+  };
+}
+
+/**
  * Vite plugin: AISStream live vessel cache.
  *
  * AISStream does not support browser CORS and requires a private API key, so
@@ -7356,6 +7513,7 @@ export default defineConfig(({ mode }) => {
       radioBrowserProxy(),
       gbfsProxy(),
       adsbLolProxy(),
+      aa5FlightsProxy(),
       aisLiveProxy(),
       trackBackfillProxies(),
       openAiRealtimeProxy(),
