@@ -1,5 +1,12 @@
 /**
- * Shared military-aircraft ICAO24 registry (2026-06-10 playtest fix).
+ * Military-fleet adapter over the generalized `fleetRegistry.js` (2026-06-10
+ * playtest fix; generalized 2026-08-30 per the AA5 fleet layer design).
+ *
+ * `fleetRegistry.js` now owns the actual Set<icao24>-by-fleet-key logic so
+ * the AA5 layer can reuse it without duplicating membership-check code. This
+ * module is a thin, military-flavored adapter that keeps the exact function
+ * names and signatures every existing caller (`flights.js`,
+ * `militaryFlights.js`) already depends on, so neither needed to change.
  *
  * adsb.lol /v2/mil tags aircraft via its database's military flag; OpenSky
  * carries no such tag, so military aircraft (e.g. ADAPT91/92) appeared in
@@ -13,18 +20,22 @@
  *    military aircraft are still classified and styled amber.
  */
 
-const MIL_POLL_INTERVAL_MS = 60000;
+import {
+  MILITARY_FLEET_KEY,
+  isFleetLayerActive,
+  setFleetLayerActive,
+  onFleetLayerActiveChange,
+  registerFleetIcaos,
+  isFleetIcao,
+  refreshFleetRegistryIfStale,
+} from './fleetRegistry.js';
 
-/** @type {Set<string>} Lowercase ICAO24 hexes known to be military. */
-const _milIcaos = new Set();
-/** @type {boolean} True while the dedicated military layer is enabled. */
-let _militaryLayerActive = false;
-/** @type {Set<(active: boolean) => void>} Fired on active-state TRANSITIONS. */
-const _activeChangeListeners = new Set();
-/** @type {number} Epoch ms of the last registry refresh (any source). */
-let _lastRefreshMs = 0;
-/** @type {boolean} A self-poll fetch is in flight. */
-let _polling = false;
+const MIL_POLL_INTERVAL_MS = 60000;
+const MIL_ENDPOINT = '/api/adsblol/mil';
+const extractMilIcaos = (data) => {
+  const aircraft = Array.isArray(data?.ac) ? data.ac : [];
+  return aircraft.map((entry) => entry?.hex);
+};
 
 /**
  * True when the dedicated military layer currently renders these aircraft
@@ -32,7 +43,7 @@ let _polling = false;
  * @returns {boolean}
  */
 export function isMilitaryLayerActive() {
-  return _militaryLayerActive;
+  return isFleetLayerActive(MILITARY_FLEET_KEY);
 }
 
 /**
@@ -44,16 +55,7 @@ export function isMilitaryLayerActive() {
  * @returns {void}
  */
 export function setMilitaryLayerActive(active) {
-  const next = !!active;
-  if (next === _militaryLayerActive) return;
-  _militaryLayerActive = next;
-  for (const listener of _activeChangeListeners) {
-    try {
-      listener(next);
-    } catch {
-      // a broken listener must never break the layer toggle
-    }
-  }
+  setFleetLayerActive(MILITARY_FLEET_KEY, active);
 }
 
 /**
@@ -63,9 +65,7 @@ export function setMilitaryLayerActive(active) {
  * @returns {() => void} Unsubscribe function.
  */
 export function onMilitaryLayerActiveChange(listener) {
-  if (typeof listener !== 'function') return () => {};
-  _activeChangeListeners.add(listener);
-  return () => _activeChangeListeners.delete(listener);
+  return onFleetLayerActiveChange(MILITARY_FLEET_KEY, listener);
 }
 
 /**
@@ -76,11 +76,7 @@ export function onMilitaryLayerActiveChange(listener) {
  * @returns {void}
  */
 export function registerMilitaryIcaos(icaos) {
-  for (const icao of icaos || []) {
-    const hex = String(icao || '').trim().toLowerCase();
-    if (hex) _milIcaos.add(hex);
-  }
-  _lastRefreshMs = Date.now();
+  registerFleetIcaos(MILITARY_FLEET_KEY, icaos);
 }
 
 /**
@@ -89,7 +85,7 @@ export function registerMilitaryIcaos(icaos) {
  * @returns {boolean}
  */
 export function isMilitaryIcao(icao24) {
-  return _milIcaos.has(String(icao24 || '').toLowerCase());
+  return isFleetIcao(MILITARY_FLEET_KEY, icao24);
 }
 
 /**
@@ -100,20 +96,10 @@ export function isMilitaryIcao(icao24) {
  * @returns {void} Fire-and-forget; failures leave the current set intact.
  */
 export function refreshMilitaryRegistryIfStale() {
-  if (_militaryLayerActive) return; // military layer's polls keep us fresh
-  if (_polling || (Date.now() - _lastRefreshMs) < MIL_POLL_INTERVAL_MS) return;
-  _polling = true;
-  (async () => {
-    try {
-      const response = await fetch('/api/adsblol/mil', { signal: AbortSignal.timeout(10000) });
-      if (!response.ok) return;
-      const data = await response.json();
-      const aircraft = Array.isArray(data?.ac) ? data.ac : [];
-      registerMilitaryIcaos(aircraft.map((entry) => entry?.hex));
-    } catch {
-      // keep the existing set on any failure
-    } finally {
-      _polling = false;
-    }
-  })();
+  refreshFleetRegistryIfStale(MILITARY_FLEET_KEY, {
+    endpoint: MIL_ENDPOINT,
+    pollIntervalMs: MIL_POLL_INTERVAL_MS,
+    extractIcaos: extractMilIcaos,
+    isActive: isMilitaryLayerActive,
+  });
 }
