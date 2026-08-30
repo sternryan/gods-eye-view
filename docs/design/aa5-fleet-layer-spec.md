@@ -523,3 +523,101 @@ scope (backend-shaped feature addition to an existing UI, no new product surface
   full-fleet coverage.
 - Owner/mechanism for the manual census-export step (Reviewer Concerns — flagged as
   the single most likely thing to quietly rot this project).
+
+## T1 rate-limit spike findings (2026-08-30, smithy job 5675525a)
+
+Live probes against both APIs from this session (curl + Python, real requests, not
+documentation guesses). Full method and raw numbers below; conclusion first.
+
+**Source choice: adsb.lol**, not OpenSky, as primary for the AA5 aggregator.
+
+**Critical finding — the spec's 20s full-fleet refresh assumption (Next Steps #2) does
+not hold for either source at 2,760 hexes.** Both sources cap how many ICAO hexes fit in
+one request; covering the full fleet needs multiple sequential requests per poll cycle,
+and both sources rate-limit request bursts. A full-fleet refresh realistically takes on
+the order of 1-2 minutes, not 20 seconds. This makes the "rotating subset per cycle"
+fallback (Open Questions, currently framed as a contingency) load-bearing for v1, not
+optional — see Fallback design below.
+
+### OpenSky
+
+- Confirmed via the official REST API docs: an `icao24`-filtered (serial-only, no bbox)
+  `/states/all` call costs **1 credit**, same for anonymous and authenticated callers.
+  Anonymous: 400 credits/day. Authenticated (registered, non-feeder): 4,000 credits/day.
+- This repo's existing OpenSky proxy (`vite.config.js` OpenSky OAuth section) already
+  documents a live incident with the *global, unfiltered* `/states/all` it uses for the
+  regional civilian layer: that call costs **4 credits** and burned the entire
+  4,000/day authenticated budget in ~8 hours at a 30s poll interval, hard-killing the
+  layer until the daily reset. An icao24-filtered call is cheaper per call (1 vs 4
+  credits) but the app is already running close to its OpenSky budget on an unrelated
+  layer — a new AA5 consumer competes for the same daily pool.
+- Empirically confirmed the URL-length ceiling: `/states/all?icao24=...&icao24=...`
+  returns HTTP 200 up to **550 repeated `icao24` params** (~7.7KB URL) and HTTP 400 at
+  600+ (~8.4KB) — an 8KB request-line cap. Covering 2,760 hexes needs **6 batched
+  calls** = 6 credits per full cycle.
+- At 6 credits/cycle, a literal 20s cache (4,320 cycles/day) would need 25,920
+  credits/day — over 6x the authenticated daily budget, before accounting for the
+  existing regional layer's own consumption. Even reserving a generous 1,000
+  credits/day just for AA5 caps the sustainable cycle at ~166/day, i.e. one full-fleet
+  refresh roughly every 8-9 minutes.
+
+### adsb.lol (chosen)
+
+- No documented credit/quota system — the project's own docs say limits are "dynamic
+  based on load" with no published number (checked `github.com/adsblol/api` README and
+  `api.adsb.lol/docs`).
+- Empirically confirmed the batch-size ceiling on `/v2/hex/<hex1>,<hex2>,...`: 200 OK up
+  to **~125 hexes per request** (~900-byte path), HTTP 414 (URI Too Long) above that —
+  a much tighter cap than OpenSky's. Covering 2,760 hexes needs **~23 batched calls**
+  per full cycle.
+- Empirically confirmed a real burst rate limit: 23 sequential 120-hex requests fired
+  back-to-back (no delay) got 4 successful 200s then HTTP 429 on every call after. A
+  second run spacing requests 3s apart completed all 10 test calls at 200 (no 429s),
+  though the first several calls showed elevated latency (15-45s) consistent with
+  residual throttling from the prior burst before settling to sub-second responses.
+  No `Retry-After` header was observed on the 429 responses.
+- Conclusion: a full 2,760-hex cycle needs ~23 calls; at a conservative ≥3s spacing to
+  stay clear of the burst limit, one full cycle takes **roughly 70-120+ seconds**, not
+  20s. This matches the existing `/api/adsblol/mil` proxy's own posture in this codebase
+  (12s cache, single unfiltered global endpoint, no batching needed there because it has
+  no allowlist to chunk) — the AA5 case is structurally different because it needs a
+  large explicit hex allowlist, which the military endpoint does not.
+- Chosen over OpenSky because: (a) no shared daily quota to compete with the existing
+  OpenSky-backed regional layer, which the codebase's own comments show already runs
+  close to its budget; (b) already the established pattern for the military layer in
+  this codebase (`adsbLolProxy()`, `/api/adsblol/mil`), so the new AA5 proxy follows
+  precedent rather than introducing a second batching strategy; (c) the real
+  differentiator (OpenSky's stated hard daily quota vs. adsb.lol's undocumented,
+  load-based limit) favors adsb.lol for a request pattern this size, with the
+  acknowledged risk that "dynamic, undocumented" limits could tighten without notice —
+  the aggregator's failure/cold-cache states (Next Steps #2) need to treat sustained
+  429s as a real failure mode, not just upstream-down.
+
+### Revised fallback design (resolves the "rotating subset" Open Question)
+
+Given neither source supports a true 20s full-fleet cycle, the aggregator (T4) should
+poll a **rotating subset** of the allowlist per tick rather than the whole fleet every
+cycle:
+
+- Split the ~2,760-hex allowlist into chunks of ~120 hexes (adsb.lol's empirical safe
+  batch size, with headroom under the ~125 ceiling).
+- On a fixed tick (e.g. every 3-5s, matching the empirically-safe adsb.lol request
+  spacing), poll the next chunk in round-robin order and merge its result into a
+  server-side in-memory snapshot keyed by hex, each entry stamped with its own
+  last-polled time.
+- The 5-minute last-seen window (Open Questions) is evaluated per-aircraft against that
+  aircraft's own last-polled timestamp, not a single fleet-wide poll time — a full
+  rotation over ~23 chunks at one chunk per 3-5s completes in ~70-115s, comfortably
+  inside the 5-minute staleness window.
+- The existing 20s client-facing shared cache (Next Steps #2) still applies for what the
+  client receives — it now serves the current merged snapshot rather than a fresh
+  full-fleet poll, decoupling "how often the client can ask" from "how often the full
+  fleet gets refreshed."
+- This also directly satisfies the spec's own contingency requirement ("Fallback
+  contingency if the confirmed rate limit can't refresh all ~2,760 ICAOs per cycle:
+  round-robin polling a rotating subset per cycle") — the spike confirms that
+  contingency is the actual v1 design, not a fallback path.
+
+**Still open, not resolved by this spike:** the allowlist-publishing decision (server-
+side vs. public bundle) and the 1,888-vs-2,760 denominator question are unrelated to
+rate limits and remain open per the sections above.
