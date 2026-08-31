@@ -133,6 +133,20 @@ Douglas-Peucker simplification, 6-decimal rounding).
 
 ---
 
+## AA-5 fleet allowlist (`config/aa5_allowlist.json`)
+
+Static snapshot of the Grumman AA-5 family census: FAA Releasable Aircraft Database
+(public domain, US government work) as ingested by the sibling `aa5-observatory`
+checkout — registered airframes with a non-blank Mode-S hex only (deregistered
+airframes are excluded on purpose: their hexes can be reassigned to unrelated
+aircraft). Provenance and counts: `config/aa5_allowlist.meta.json` (`generatedAt`
+stamp). ⚠ Accuracy degrades with snapshot age — a hex reassigned after
+`generatedAt` can paint a non-Grumman on the globe (accepted risk, Ryan ruling
+2026-08-31). Refresh with `node scripts/export-aa5-allowlist.mjs` when touching
+the project. Live positions come from adsb.lol (already credited below).
+
+---
+
 ## In-app attribution
 
 The required Google Maps / Cesium credit renders on the on-globe credit line (`#cesium-credits`, bottom-left) and must stay visible — including in clean-view and recording modes (the whole line, logo + "Google Maps" + the "Data attribution" link, stays on screen; only the GEV panels/HUD fade). The layer-specific credits (adsb.lol, TeleGeography, OSM datacenters/dams/roads, NASA FIRMS, CelesTrak, USGS, City of Austin, GBFS, Radio Browser, OpenSky, AISStream) are registered into the expandable **"Data attribution"** popover on that credit line via `viewer.creditDisplay.addStaticCredit(new Cesium.Credit(html, /* showOnScreen */ false))` — see `src/data/dataCredits.js`. When you add a new data source, add its license and attribution to this file **and** append an entry to `DATA_CREDITS` in `src/data/dataCredits.js` so it surfaces in the app.

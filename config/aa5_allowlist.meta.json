@@ -1,0 +1,12 @@
+{
+  "generatedAt": "2026-08-31T21:00:38.750Z",
+  "source": "aa5-observatory L0 census (/Users/ryanstern/aa5-observatory/data/aa5.db), FAA Releasable Aircraft Database ingest — registered airframes with a non-blank ICAO Mode-S hex",
+  "sourceRepo": "aa5-observatory (sibling checkout, not vendored into this repo)",
+  "entryCount": 1888,
+  "byType": {
+    "Tiger": 858,
+    "Cheetah": 484,
+    "Traveler": 385,
+    "AG-5B": 161
+  }
+}
