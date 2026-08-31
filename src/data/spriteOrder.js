@@ -5,6 +5,7 @@ export const SPRITE_LAYER_ORDER = Object.freeze([
   'bikeshare',
   'ais',
   'military',
+  'aa5',
   'flights',
 ]);
 

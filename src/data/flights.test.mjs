@@ -8,7 +8,7 @@ import flightsLayer, {
   _addFlightTrackingCandidateForTest,
   _applyPendingFlightTrackingRestoreForTest,
   _armFlightTrackingRestoreForTest,
-  _militaryLayerSuppressesForTest,
+  _fleetLayerSuppressesForTest,
   _pendingFlightTrackingRestoreForTest,
   _setFlightTrackingRefreshOutcomeForTest,
   _setTrackedFlightRefreshStateForTest,
@@ -16,7 +16,8 @@ import flightsLayer, {
   _clearDisplayFloorStateForTest,
   mapAnalystRecord,
 } from './flights.js';
-import { setMilitaryLayerActive } from './militaryRegistry.js';
+import { registerMilitaryIcaos, setMilitaryLayerActive } from './militaryRegistry.js';
+import { registerAa5Icaos, setAa5LayerActive } from './aa5Registry.js';
 import {
   GROUND_FLOOR_LIFT_M, reportMeshFloorCell,
   setMeshFloorPreferred, _clearMeshFloorCellsForTest,
@@ -687,23 +688,25 @@ test('civil tracked readout: a callsign-less enriched contact reads as its regis
 // ---------------------------------------------------------------------------
 
 const MIL_HEX = 'ae1234';
+const AA5_HEX = 'a1b2c3';
 
 test('military suppression exempts the contact this layer is still restoring', () => {
   const realWindow = globalThis.window;
   globalThis.window = new EventTarget();
   try {
+    registerMilitaryIcaos([MIL_HEX, 'bb9999']);
     _armFlightTrackingRestoreForTest(null);
 
     setMilitaryLayerActive(false);
     assert.equal(
-      _militaryLayerSuppressesForTest(MIL_HEX),
+      _fleetLayerSuppressesForTest(MIL_HEX),
       false,
       'nothing is suppressed while the Military layer is off',
     );
 
     setMilitaryLayerActive(true);
     assert.equal(
-      _militaryLayerSuppressesForTest(MIL_HEX),
+      _fleetLayerSuppressesForTest(MIL_HEX),
       true,
       'an ordinary mil-registry duplicate is suppressed',
     );
@@ -712,20 +715,62 @@ test('military suppression exempts the contact this layer is still restoring', (
     // never render, never track, and reported a feed failure instead.
     _armFlightTrackingRestoreForTest(MIL_HEX);
     assert.equal(
-      _militaryLayerSuppressesForTest(MIL_HEX),
+      _fleetLayerSuppressesForTest(MIL_HEX),
       false,
       'a contact held on the restore latch must still render in this layer',
     );
     assert.equal(
-      _militaryLayerSuppressesForTest('bb9999'),
+      _fleetLayerSuppressesForTest('bb9999'),
       true,
       'the exemption is scoped to the pending target only',
     );
 
     _armFlightTrackingRestoreForTest(null);
-    assert.equal(_militaryLayerSuppressesForTest(MIL_HEX), true);
+    assert.equal(_fleetLayerSuppressesForTest(MIL_HEX), true);
   } finally {
     setMilitaryLayerActive(false);
+    _armFlightTrackingRestoreForTest(null);
+    globalThis.window = realWindow;
+  }
+});
+
+// The AA-5 layer claims its own fleet, so suppression is per fleet: turning the
+// Military layer on must never blank an AA-5 duplicate this layer still owns,
+// and vice versa.
+test('dedicated-fleet suppression is scoped to the fleet whose layer is on', () => {
+  const realWindow = globalThis.window;
+  globalThis.window = new EventTarget();
+  try {
+    registerMilitaryIcaos([MIL_HEX]);
+    registerAa5Icaos([AA5_HEX]);
+    _armFlightTrackingRestoreForTest(null);
+
+    setMilitaryLayerActive(true);
+    setAa5LayerActive(false);
+    assert.equal(_fleetLayerSuppressesForTest(MIL_HEX), true);
+    assert.equal(
+      _fleetLayerSuppressesForTest(AA5_HEX),
+      false,
+      'the Military layer must not suppress an AA-5 duplicate',
+    );
+
+    setMilitaryLayerActive(false);
+    setAa5LayerActive(true);
+    assert.equal(_fleetLayerSuppressesForTest(AA5_HEX), true);
+    assert.equal(
+      _fleetLayerSuppressesForTest(MIL_HEX),
+      false,
+      'the AA-5 layer must not suppress a military duplicate',
+    );
+
+    assert.equal(
+      _fleetLayerSuppressesForTest('c0ffee'),
+      false,
+      'a hex in neither fleet registry is never suppressed',
+    );
+  } finally {
+    setMilitaryLayerActive(false);
+    setAa5LayerActive(false);
     _armFlightTrackingRestoreForTest(null);
     globalThis.window = realWindow;
   }

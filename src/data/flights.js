@@ -61,6 +61,7 @@ import {
 } from './motionModel.js';
 import { routePlausible } from './routePlausible.js';
 import { isMilitaryIcao, isMilitaryLayerActive, refreshMilitaryRegistryIfStale, onMilitaryLayerActiveChange } from './militaryRegistry.js';
+import { isAa5Icao, isAa5LayerActive, onAa5LayerActiveChange } from './aa5Registry.js';
 import { formatFlightLevel } from './detectionDraw.js';
 import { createGroundSnap } from './groundSnap.js';
 import { trackedModelZoomActive } from './trackedModelRegime.js';
@@ -698,6 +699,8 @@ let _moveEndRemove = null;
 let _trackedEntityChangedRemove = null;
 /** @type {(() => void)|null} militaryRegistry active-transition unsubscribe (M2 handoff sweep) */
 let _milActiveChangeUnsub = null;
+/** @type {(() => void)|null} aa5Registry active-transition unsubscribe (same sweep, AA-5 fleet) */
+let _aa5ActiveChangeUnsub = null;
 
 // ---------------------------------------------------------------------------
 // Scratch (reusable) variables — avoid per-frame heap allocation
@@ -3226,10 +3229,12 @@ function _isUsableOpenSkyState(state) {
 }
 
 /**
- * Whether the Military layer suppresses this civil duplicate right now.
+ * Whether a dedicated fleet layer suppresses this civil duplicate right now.
  *
- * The dedicated Military layer owns icon/track/click for known-military
- * contacts, so the OpenSky duplicate is dropped while that layer is on. Two
+ * A dedicated fleet layer (Military, or the AA-5 fleet) owns icon/track/click
+ * for the contacts in its own registry, so the OpenSky duplicate is dropped
+ * while that layer is on. The claim is per fleet: an AA-5 hex is suppressed
+ * only by the AA-5 layer, never by the Military layer being on. Two
  * contacts are exempt, both for the same reason — this layer still owns them:
  *
  *   - the CURRENTLY tracked one, which hands off on untrack; and
@@ -3244,8 +3249,10 @@ function _isUsableOpenSkyState(state) {
  * @param {string} icao24 - Normalized ICAO 24-bit address.
  * @returns {boolean} True when the civil duplicate must be dropped.
  */
-function _militaryLayerSuppresses(icao24) {
-  if (!isMilitaryLayerActive()) return false;
+function _fleetLayerSuppresses(icao24) {
+  const claimed = (isMilitaryIcao(icao24) && isMilitaryLayerActive())
+    || (isAa5Icao(icao24) && isAa5LayerActive());
+  if (!claimed) return false;
   if (icao24 === _trackedIcao) return false;
   if (icao24 === _pendingTrackingRestore?.id) return false;
   return true;
@@ -3436,9 +3443,9 @@ export function _addFlightTrackingCandidateForTest({ icao24, meta, billboard, hi
   _positionHistory.set(icao24, history);
 }
 
-/** Expose the military-suppression decision for the civil duplicate. */
-export function _militaryLayerSuppressesForTest(icao24) {
-  return _militaryLayerSuppresses(icao24);
+/** Expose the dedicated-fleet suppression decision for the civil duplicate. */
+export function _fleetLayerSuppressesForTest(icao24) {
+  return _fleetLayerSuppresses(icao24);
 }
 
 /** Arm the deferred restore latch directly, without a full setParams turn. */
@@ -3673,31 +3680,33 @@ function _trackFlight(icao24, { origin = 'programmatic' } = {}) {
 }
 
 /**
- * Immediate military-suppression handoff sweep (pre-ship audit M2).
+ * Immediate fleet-suppression handoff sweep (pre-ship audit M2).
  *
  * The poll-time suppression branch in update() only reconciles every 30 s, so
- * toggling the Military layer showed duplicate icons (military ON: both layers
- * render the same aircraft ~3-4 km apart) or holes (military OFF: suppressed
- * aircraft absent) for up to a full poll. Fired synchronously by the registry
- * on the active-state TRANSITION:
+ * toggling a dedicated fleet layer showed duplicate icons (fleet layer ON:
+ * both layers render the same aircraft ~3-4 km apart) or holes (fleet layer
+ * OFF: suppressed aircraft absent) for up to a full poll. Fired synchronously
+ * by the registry on the active-state TRANSITION:
  *
- *  - activated  → suppress known-military billboards NOW (mirror of the
+ *  - activated  → suppress that fleet's billboards NOW (mirror of the
  *    poll-time branch, tracked aircraft excluded — it hands off on untrack);
  *  - deactivated → the suppressed aircraft's state was deleted, so bring the
  *    next OpenSky poll forward instead of waiting out the interval (update()
  *    itself still honors _retryAt backoff).
  *
- * @param {boolean} active - New military-layer active state.
+ * @param {boolean} active - New fleet-layer active state.
+ * @param {(icao24: string) => boolean} belongsToFleet - Membership test for the
+ *   fleet whose layer just toggled.
  * @returns {void}
  */
-function _onMilitaryActiveChange(active) {
+function _onFleetActiveChange(active, belongsToFleet) {
   if (!_viewer || !_billboardCollection) return;
   if (active) {
     for (const [icao24, bb] of _billboards) {
-      if (!isMilitaryIcao(icao24) || icao24 === _trackedIcao) continue;
+      if (!belongsToFleet(icao24) || icao24 === _trackedIcao) continue;
       _billboardCollection.remove(bb);
       _billboards.delete(icao24);
-      _releaseModel(icao24); // military-suppression: drop any 3D model too
+      _releaseModel(icao24); // fleet-suppression: drop any 3D model too
       _flightData.delete(icao24);
       _positionHistory.delete(icao24);
       _displayCourse.delete(icao24);
@@ -3952,10 +3961,17 @@ const flightsLayer = {
 
     _installClickHandler(viewer);
 
-    // React to Military-layer toggles IMMEDIATELY (suppress/restore sweep)
-    // instead of waiting out the 30 s poll (M2).
+    // React to dedicated-fleet-layer toggles IMMEDIATELY (suppress/restore
+    // sweep) instead of waiting out the 30 s poll (M2).
     if (!_milActiveChangeUnsub) {
-      _milActiveChangeUnsub = onMilitaryLayerActiveChange(_onMilitaryActiveChange);
+      _milActiveChangeUnsub = onMilitaryLayerActiveChange(
+        (active) => _onFleetActiveChange(active, isMilitaryIcao),
+      );
+    }
+    if (!_aa5ActiveChangeUnsub) {
+      _aa5ActiveChangeUnsub = onAa5LayerActiveChange(
+        (active) => _onFleetActiveChange(active, isAa5Icao),
+      );
     }
 
     restoreSpriteOrder(viewer);
@@ -4194,17 +4210,16 @@ const flightsLayer = {
         acceptedSnapshotIcaos.add(icao24);
         const onGround = on_ground === true;
 
-        // Known-military aircraft: the dedicated military layer wins
-        // (icon + track + click) while it is enabled — suppress the
+        // Aircraft owned by a dedicated fleet layer (military, AA-5): that
+        // layer wins (icon + track + click) while it is enabled — suppress the
         // OpenSky duplicate entirely (except a currently tracked one,
         // which hands off on untrack).
-        const isMil = isMilitaryIcao(icao24);
-        if (isMil && _militaryLayerSuppresses(icao24)) {
+        if (_fleetLayerSuppresses(icao24)) {
           const dupe = _billboards.get(icao24);
           if (dupe) {
             _billboardCollection.remove(dupe);
             _billboards.delete(icao24);
-            _releaseModel(icao24); // military-suppression: drop any 3D model too
+            _releaseModel(icao24); // fleet-suppression: drop any 3D model too
             _flightData.delete(icao24);
             _positionHistory.delete(icao24);
             _displayCourse.delete(icao24);
@@ -4657,6 +4672,10 @@ const flightsLayer = {
     if (_milActiveChangeUnsub) {
       _milActiveChangeUnsub();
       _milActiveChangeUnsub = null;
+    }
+    if (_aa5ActiveChangeUnsub) {
+      _aa5ActiveChangeUnsub();
+      _aa5ActiveChangeUnsub = null;
     }
     document.removeEventListener('keydown', _onKeyDown);
     if (_cockpitModeListener) {
